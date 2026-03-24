@@ -1,22 +1,3 @@
-"""
-Project skeleton: Survival prediction with two endpoints (NPE, Hospitalisation)
-
-Primary analysis cohort: ACE-available subset.
-Primary model: Demographics + ACE
-Secondary model: Demographics + ACE + Volumetric MRI
-(Optionally: additional ML survival models in sensitivity analysis)
-
-Assumptions about input tabular data (one row per participant):
-- id: unique identifier
-- demographics columns (mix of numeric + categorical)
-- ACE column (numeric, may be missing for ~2/3)
-- volumetric MRI columns (numeric; available for all)
-- endpoints:
-    * time_npe, event_npe   (time-to-neuropsychiatric event, 1=event, 0=censored)
-    * time_hosp, event_hosp (time-to-hospitalisation,        1=event, 0=censored)
-Times should be in a consistent unit (e.g., days).
-"""
-
 from __future__ import annotations
 
 
@@ -48,11 +29,6 @@ except ImportError as e:
         "This skeleton expects scikit-survival. Install with: pip install scikit-survival"
     ) from e
 
-
-# =========================
-# Config
-# =========================
-
 @dataclass(frozen=True) 
 class Config:
     data_path: str = "data/fake_data/mgus2_june_paper_placeholder_cleaned.csv"  # TODO
@@ -67,7 +43,8 @@ class Config:
     event_hosp: str = "competing_event_indicator"
 
     # Horizons for time-dependent AUC (in same units as time columns)
-    horizons: Tuple[float, ...] = (90.0, 180.0, 270.0, 365.0, 424.0)  # e.g., 3, 6, 9, 12, 14 months in days
+    # In Config — change horizons to months
+    horizons: Tuple[float, ...] = (12.0, 24.0, 36.0, 60.0)  # 1, 2, 3, 5 years in months
 
     # CV
     n_splits: int = 5
@@ -75,8 +52,8 @@ class Config:
     random_state: int = 42
 
     # Coxnet regularisation path
-    coxnet_l1_ratio: float = 0.5
-    coxnet_alphas: Optional[np.ndarray] = None  # set to array to control
+    coxnet_l1_ratio: float = 0.01
+    coxnet_alphas: Optional[np.ndarray] = 0.1 * np.logspace(-4, 4, 50)  # if None, will use default path from data
 
     # RSF / GBS (optional sensitivity)
     rsf_n_estimators: int = 500
@@ -94,15 +71,23 @@ class Config:
 
 CFG = Config()
 
-
-# =========================
-# Utilities
-# =========================
+class NumpyEncoder(json.JSONEncoder):
+    """Serialise numpy scalars and arrays transparently."""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        return super().default(obj)
+# cfg = CFG
 
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     return df
-
 
 def infer_feature_types(
     df: pd.DataFrame,
@@ -116,7 +101,6 @@ def infer_feature_types(
         else:
             categorical.append(c)
     return numeric, categorical
-
 
 def make_preprocessor(
     numeric_features: List[str],
@@ -143,7 +127,6 @@ def make_preprocessor(
     )
     return pre
 
-
 def make_y_surv(df: pd.DataFrame, time_col: str, event_col: str):
     """Create scikit-survival structured array."""
     # event must be boolean
@@ -151,15 +134,10 @@ def make_y_surv(df: pd.DataFrame, time_col: str, event_col: str):
     time = df[time_col].astype(float).values
     return Surv.from_arrays(event=event, time=time)
 
-
 def get_primary_cohort(df: pd.DataFrame, ace_col: str) -> pd.DataFrame:
     """Primary cohort is ACE-available subset."""
     return df.loc[df[ace_col].notna()].copy()
 
-
-# =========================
-# Models
-# =========================
 
 def build_models(cfg: Config) -> Dict[str, object]:
     """
@@ -189,7 +167,6 @@ def build_models(cfg: Config) -> Dict[str, object]:
     )
 
     return models
-
 
 def select_best_coxnet_alpha(
     X_train, y_train, base_estimator: CoxnetSurvivalAnalysis, inner_splits: int = 5, seed: int = 0
@@ -227,52 +204,68 @@ def select_best_coxnet_alpha(
     final_est.set_params(alphas=np.array([best_alpha]))
     return final_est
 
-
-# =========================
-# Evaluation
-# =========================
-
 def eval_fold(
-    preprocessor: ColumnTransformer,
-    estimator,
-    X_train_df: pd.DataFrame,
-    y_train,
-    X_test_df: pd.DataFrame,
-    y_test,
-    horizons: Tuple[float, ...],
-    choose_alpha_for_coxnet: bool = True,
-    inner_seed: int = 0,
+    preprocessor, estimator,
+    X_train_df, y_train,
+    X_test_df, y_test,
+    horizons, choose_alpha_for_coxnet=True, inner_seed=0,
 ):
-    """
-    Fit on train, predict on test, return:
-    - risk scores
-    - c-index
-    - time-dependent AUC array at horizons
-    """
-    # Fit preprocessor on train
+    from sksurv.nonparametric import kaplan_meier_estimator
+
     X_train = preprocessor.fit_transform(X_train_df)
     X_test = preprocessor.transform(X_test_df)
 
     est = clone(estimator)
-
-    # If Coxnet, optionally select best alpha on training fold
     if isinstance(est, CoxnetSurvivalAnalysis) and choose_alpha_for_coxnet:
         est = select_best_coxnet_alpha(
             X_train, y_train, base_estimator=est, inner_splits=5, seed=inner_seed
         )
 
     est.fit(X_train, y_train)
-
     risk_test = est.predict(X_test)
 
     cidx = concordance_index_censored(y_test["event"], y_test["time"], risk_test)[0]
 
-    # cumulative_dynamic_auc expects train survival info to define the IPCW weights
-    aucs, mean_auc = cumulative_dynamic_auc(
-        y_train, y_test, risk_test, np.array(horizons, dtype=float)
+    # --- Determine the safe upper time limit from the censoring KM on training data ---
+    # Censoring indicator is the *inverse* of the event indicator
+    cens_times, cens_surv = kaplan_meier_estimator(
+        ~y_train["event"],   # True = censored
+        y_train["time"]
     )
-    return risk_test, float(cidx), aucs.astype(float)
+    # Find the last time point where the censoring survival is still > 0
+    nonzero_mask = cens_surv > 0
+    if not nonzero_mask.any():
+        # Degenerate fold — skip AUC entirely
+        return risk_test, float(cidx), np.full(len(horizons), np.nan)
 
+    max_cens_time = float(cens_times[nonzero_mask].max())
+
+    # Safe upper bound: must be < max test time AND within censoring support
+    max_test_time = float(y_test["time"].max())
+    upper = min(max_test_time, max_cens_time)
+
+    valid_horizons = np.array([h for h in horizons if h < upper], dtype=float)
+
+    if len(valid_horizons) == 0:
+        return risk_test, float(cidx), np.full(len(horizons), np.nan)
+
+    # Drop test subjects whose times fall beyond the censoring support
+    # (their IPCW weights would be undefined)
+    keep = y_test["time"] <= max_cens_time
+    if keep.sum() < 2:
+        return risk_test, float(cidx), np.full(len(horizons), np.nan)
+    
+    print(f"Fold: keeping {keep.sum()}/{len(keep)} test subjects for AUC")
+
+    aucs, _ = cumulative_dynamic_auc(
+        y_train, y_test[keep], risk_test[keep], valid_horizons
+    )
+
+    full_aucs = np.full(len(horizons), np.nan)
+    valid_mask = np.array([h < upper for h in horizons])
+    full_aucs[valid_mask] = aucs.astype(float)
+
+    return risk_test, float(cidx), full_aucs
 
 def cross_val_oof_predictions(
     df: pd.DataFrame,
@@ -419,10 +412,20 @@ def calibration_table_at_horizon(
     out["horizon"] = horizon
     return out
 
+demo_cols = [
+        "baseline_age", "sex", "baseline_biomarker_2", "baseline_biomarker_3",
+        "baseline_biomarker_1_missing", "baseline_biomarker_2_missing", "baseline_biomarker_3_missing"
+    ]
 
-# =========================
-# End-to-end runner
-# =========================
+ace_col = "baseline_biomarker_1"
+time_col = "time_to_primary_event_months"
+event_col = "primary_event_indicator"
+dat = pd.read_csv("data/fake_data/mgus2_june_paper_placeholder_cleaned.csv")
+# drop rows with missing values
+dat = dat.dropna()
+df_primary = dat
+
+df_primary.head()
 
 def run_endpoint(
     df_primary: pd.DataFrame,
@@ -456,6 +459,8 @@ def run_endpoint(
         estimator=est,
         cfg=cfg
     )
+        
+
     res_secondary = cross_val_oof_predictions(
         df=df_primary,
         feature_cols=secondary_features,
@@ -464,6 +469,7 @@ def run_endpoint(
         estimator=est,
         cfg=cfg
     )
+    
 
     # ---- Summaries across folds ----
     primary_cidx_mean = float(res_primary["fold_cindex"].mean())
@@ -471,11 +477,11 @@ def run_endpoint(
     delta_cidx_mean = secondary_cidx_mean - primary_cidx_mean
 
     # Fold-level AUC summaries (mean over horizons and folds)
-    primary_auc_mean_by_h = res_primary["fold_auc"].mean(axis=0)
-    secondary_auc_mean_by_h = res_secondary["fold_auc"].mean(axis=0)
+    primary_auc_mean_by_h = np.nanmean(res_primary["fold_auc"], axis=0)
+    secondary_auc_mean_by_h = np.nanmean(res_secondary["fold_auc"], axis=0)
     delta_auc_mean_by_h = secondary_auc_mean_by_h - primary_auc_mean_by_h
 
-    # ---- Bootstrap CIs over folds (paired deltas) ----
+   # ---- Bootstrap CIs over folds (paired deltas) ----
     cidx_delta_ci = bootstrap_delta_ci(
         res_primary["fold_cindex"],
         res_secondary["fold_cindex"],
@@ -540,15 +546,12 @@ def run_endpoint(
         }
     }
 
-
 def main(cfg: Config):
     df = load_data(cfg.data_path)
     df.columns
 
-    # TODO: define your feature columns explicitly
-    # Example placeholders:
     demo_cols = [
-        "baseline_age", "sex", "baseline_biomarker_1", "baseline_biomarker_2", "baseline_biomarker_3",
+        "baseline_age", "sex", "baseline_biomarker_2", "baseline_biomarker_3",
         "baseline_biomarker_1_missing", "baseline_biomarker_2_missing", "baseline_biomarker_3_missing"
     ]
     # mri_cols = [
@@ -616,7 +619,7 @@ def main(cfg: Config):
 
     os.makedirs("outputs", exist_ok=True)
     with open("outputs/summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, cls=NumpyEncoder)
 
     # Save calibration tables
     for key, res in results.items():
@@ -628,5 +631,7 @@ def main(cfg: Config):
 
 if __name__ == "__main__":
     main(CFG)
+
+
 
 
